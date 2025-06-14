@@ -1,0 +1,978 @@
+// package.json
+{
+  "name": "employee-management-api",
+  "version": "1.0.0",
+  "description": "REST API for Employee Management with MongoDB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "migrate": "node migrations/migrate.js",
+    "seed": "node migrations/seed.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^8.0.3",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "dotenv": "^16.3.1",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
+
+// .env (Environment Configuration)
+NODE_ENV=development
+PORT=3000
+
+# Database Configuration
+MONGODB_URI=mongodb://localhost:27017/employee_management
+MONGODB_TEST_URI=mongodb://localhost:27017/employee_management_test
+
+# Database Connection Pool Settings
+DB_MAX_POOL_SIZE=10
+DB_MIN_POOL_SIZE=5
+DB_MAX_IDLE_TIME=30000
+DB_SERVER_SELECTION_TIMEOUT=5000
+
+# JWT Configuration
+JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+JWT_EXPIRE=24h
+
+# Admin Credentials
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=admin123
+
+# Rate Limiting
+RATE_LIMIT_WINDOW=15
+RATE_LIMIT_MAX_REQUESTS=100
+
+// config/database.js
+const mongoose = require('mongoose');
+require('dotenv').config();
+
+class Database {
+    constructor() {
+        this.connection = null;
+    }
+
+    async connect() {
+        try {
+            const options = {
+                maxPoolSize: parseInt(process.env.DB_MAX_POOL_SIZE) || 10,
+                minPoolSize: parseInt(process.env.DB_MIN_POOL_SIZE) || 5,
+                maxIdleTimeMS: parseInt(process.env.DB_MAX_IDLE_TIME) || 30000,
+                serverSelectionTimeoutMS: parseInt(process.env.DB_SERVER_SELECTION_TIMEOUT) || 5000,
+                socketTimeoutMS: 45000,
+                bufferMaxEntries: 0,
+                useNewUrlParser: true,
+                useUnifiedTopology: true
+            };
+
+            const uri = process.env.NODE_ENV === 'test' 
+                ? process.env.MONGODB_TEST_URI 
+                : process.env.MONGODB_URI;
+
+            this.connection = await mongoose.connect(uri, options);
+            
+            console.log(`✅ MongoDB Connected: ${this.connection.connection.host}`);
+            console.log(`📊 Database: ${this.connection.connection.name}`);
+            console.log(`🏊 Pool Size: ${options.maxPoolSize} connections`);
+
+            // Connection event listeners
+            mongoose.connection.on('error', (err) => {
+                console.error('❌ MongoDB connection error:', err);
+            });
+
+            mongoose.connection.on('disconnected', () => {
+                console.warn('⚠️ MongoDB disconnected');
+            });
+
+            mongoose.connection.on('reconnected', () => {
+                console.log('🔄 MongoDB reconnected');
+            });
+
+            return this.connection;
+        } catch (error) {
+            console.error('❌ Database connection failed:', error.message);
+            process.exit(1);
+        }
+    }
+
+    async disconnect() {
+        try {
+            await mongoose.connection.close();
+            console.log('📤 MongoDB connection closed');
+        } catch (error) {
+            console.error('❌ Error closing database connection:', error.message);
+        }
+    }
+
+    getConnectionState() {
+        const states = {
+            0: 'disconnected',
+            1: 'connected',
+            2: 'connecting',
+            3: 'disconnecting'
+        };
+        return states[mongoose.connection.readyState] || 'unknown';
+    }
+}
+
+module.exports = new Database();
+
+// models/Admin.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const adminSchema = new mongoose.Schema({
+    username: {
+        type: String,
+        required: [true, 'Username is required'],
+        unique: true,
+        trim: true,
+        minlength: [3, 'Username must be at least 3 characters'],
+        maxlength: [50, 'Username cannot exceed 50 characters']
+    },
+    password: {
+        type: String,
+        required: [true, 'Password is required'],
+        minlength: [6, 'Password must be at least 6 characters']
+    },
+    email: {
+        type: String,
+        required: [true, 'Email is required'],
+        unique: true,
+        trim: true,
+        lowercase: true,
+        match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email']
+    },
+    role: {
+        type: String,
+        enum: ['admin', 'super_admin'],
+        default: 'admin'
+    },
+    isActive: {
+        type: Boolean,
+        default: true
+    },
+    lastLogin: {
+        type: Date
+    },
+    loginAttempts: {
+        type: Number,
+        default: 0
+    },
+    lockUntil: Date
+}, {
+    timestamps: true
+});
+
+// Indexes for performance
+adminSchema.index({ username: 1 });
+adminSchema.index({ email: 1 });
+
+// Virtual for account lock status
+adminSchema.virtual('isLocked').get(function() {
+    return !!(this.lockUntil && this.lockUntil > Date.now());
+});
+
+// Pre-save middleware to hash password
+adminSchema.pre('save', async function(next) {
+    if (!this.isModified('password')) return next();
+    
+    try {
+        const salt = await bcrypt.genSalt(12);
+        this.password = await bcrypt.hash(this.password, salt);
+        next();
+    } catch (error) {
+        next(error);
+    }
+});
+
+// Method to compare password
+adminSchema.methods.comparePassword = async function(candidatePassword) {
+    return bcrypt.compare(candidatePassword, this.password);
+};
+
+// Method to increment login attempts
+adminSchema.methods.incLoginAttempts = function() {
+    if (this.lockUntil && this.lockUntil < Date.now()) {
+        return this.updateOne({
+            $unset: { lockUntil: 1 },
+            $set: { loginAttempts: 1 }
+        });
+    }
+    
+    const updates = { $inc: { loginAttempts: 1 } };
+    
+    if (this.loginAttempts + 1 >= 5 && !this.isLocked) {
+        updates.$set = { lockUntil: Date.now() + 2 * 60 * 60 * 1000 }; // 2 hours
+    }
+    
+    return this.updateOne(updates);
+};
+
+// Method to reset login attempts
+adminSchema.methods.resetLoginAttempts = function() {
+    return this.updateOne({
+        $unset: { loginAttempts: 1, lockUntil: 1 },
+        $set: { lastLogin: new Date() }
+    });
+};
+
+module.exports = mongoose.model('Admin', adminSchema);
+
+// models/Employee.js
+const mongoose = require('mongoose');
+
+const employeeSchema = new mongoose.Schema({
+    employeeId: {
+        type: String,
+        required: true,
+        unique: true,
+        uppercase: true,
+        match: [/^EMP\d{4}$/, 'Employee ID must follow format EMP0001']
+    },
+    personalInfo: {
+        firstName: {
+            type: String,
+            required: [true, 'First name is required'],
+            trim: true,
+            minlength: [2, 'First name must be at least 2 characters'],
+            maxlength: [50, 'First name cannot exceed 50 characters']
+        },
+        lastName: {
+            type: String,
+            required: [true, 'Last name is required'],
+            trim: true,
+            minlength: [2, 'Last name must be at least 2 characters'],
+            maxlength: [50, 'Last name cannot exceed 50 characters']
+        },
+        email: {
+            type: String,
+            required: [true, 'Email is required'],
+            unique: true,
+            trim: true,
+            lowercase: true,
+            match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email']
+        },
+        phone: {
+            type: String,
+            required: [true, 'Phone number is required'],
+            trim: true,
+            match: [/^[\+]?[1-9][\d]{0,15}$/, 'Please enter a valid phone number']
+        },
+        dateOfBirth: {
+            type: Date,
+            required: [true, 'Date of birth is required'],
+            validate: {
+                validator: function(value) {
+                    return value < new Date();
+                },
+                message: 'Date of birth must be in the past'
+            }
+        },
+        address: {
+            street: String,
+            city: String,
+            state: String,
+            zipCode: String,
+            country: {
+                type: String,
+                default: 'USA'
+            }
+        }
+    },
+    employment: {
+        department: {
+            type: String,
+            required: [true, 'Department is required'],
+            enum: {
+                values: ['Engineering', 'Marketing', 'Sales', 'HR', 'Finance', 'Operations', 'IT', 'Legal'],
+                message: 'Invalid department'
+            }
+        },
+        position: {
+            type: String,
+            required: [true, 'Position is required'],
+            trim: true,
+            minlength: [2, 'Position must be at least 2 characters'],
+            maxlength: [100, 'Position cannot exceed 100 characters']
+        },
+        level: {
+            type: String,
+            enum: ['Intern', 'Junior', 'Mid-Level', 'Senior', 'Lead', 'Manager', 'Director', 'VP'],
+            default: 'Junior'
+        },
+        manager: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Employee'
+        },
+        startDate: {
+            type: Date,
+            required: [true, 'Start date is required'],
+            validate: {
+                validator: function(value) {
+                    return value <= new Date();
+                },
+                message: 'Start date cannot be in the future'
+            }
+        },
+        endDate: {
+            type: Date,
+            validate: {
+                validator: function(value) {
+                    return !value || value > this.employment.startDate;
+                },
+                message: 'End date must be after start date'
+            }
+        },
+        employmentType: {
+            type: String,
+            enum: ['Full-Time', 'Part-Time', 'Contract', 'Intern'],
+            default: 'Full-Time'
+        },
+        status: {
+            type: String,
+            enum: ['Active', 'Inactive', 'Terminated', 'On Leave'],
+            default: 'Active'
+        }
+    },
+    compensation: {
+        salary: {
+            type: Number,
+            required: [true, 'Salary is required'],
+            min: [0, 'Salary must be a positive number']
+        },
+        currency: {
+            type: String,
+            default: 'USD'
+        },
+        payFrequency: {
+            type: String,
+            enum: ['Weekly', 'Bi-Weekly', 'Monthly', 'Annually'],
+            default: 'Bi-Weekly'
+        },
+        benefits: {
+            healthInsurance: { type: Boolean, default: false },
+            dentalInsurance: { type: Boolean, default: false },
+            retirementPlan: { type: Boolean, default: false },
+            paidTimeOff: { type: Number, default: 0 }
+        }
+    },
+    performance: {
+        lastReviewDate: Date,
+        nextReviewDate: Date,
+        performanceRating: {
+            type: String,
+            enum: ['Exceeds Expectations', 'Meets Expectations', 'Below Expectations', 'Not Rated'],
+            default: 'Not Rated'
+        },
+        goals: [{
+            title: String,
+            description: String,
+            targetDate: Date,
+            status: {
+                type: String,
+                enum: ['Not Started', 'In Progress', 'Completed'],
+                default: 'Not Started'
+            }
+        }]
+    },
+    documents: [{
+        name: String,
+        type: String,
+        url: String,
+        uploadDate: {
+            type: Date,
+            default: Date.now
+        }
+    }],
+    isActive: {
+        type: Boolean,
+        default: true
+    }
+}, {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true }
+});
+
+// Indexes for performance
+employeeSchema.index({ employeeId: 1 });
+employeeSchema.index({ 'personalInfo.email': 1 });
+employeeSchema.index({ 'employment.department': 1 });
+employeeSchema.index({ 'employment.status': 1 });
+employeeSchema.index({ isActive: 1 });
+
+// Virtual for full name
+employeeSchema.virtual('personalInfo.fullName').get(function() {
+    return `${this.personalInfo.firstName} ${this.personalInfo.lastName}`;
+});
+
+// Virtual for years of service
+employeeSchema.virtual('employment.yearsOfService').get(function() {
+    const endDate = this.employment.endDate || new Date();
+    const years = (endDate - this.employment.startDate) / (365.25 * 24 * 60 * 60 * 1000);
+    return Math.max(0, Math.floor(years * 100) / 100);
+});
+
+// Pre-save middleware to generate employee ID
+employeeSchema.pre('save', async function(next) {
+    if (this.isNew && !this.employeeId) {
+        try {
+            const count = await this.constructor.countDocuments();
+            this.employeeId = `EMP${String(count + 1).padStart(4, '0')}`;
+        } catch (error) {
+            return next(error);
+        }
+    }
+    next();
+});
+
+module.exports = mongoose.model('Employee', employeeSchema);
+
+// middleware/auth.js
+const jwt = require('jsonwebtoken');
+const Admin = require('../models/Admin');
+
+const auth = async (req, res, next) => {
+    try {
+        const token = req.header('Authorization')?.replace('Bearer ', '');
+        
+        if (!token) {
+            return res.status(401).json({
+                success: false,
+                message: 'Access denied. No token provided.'
+            });
+        }
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const admin = await Admin.findById(decoded.id).select('-password');
+        
+        if (!admin) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid token. Admin not found.'
+            });
+        }
+
+        if (!admin.isActive) {
+            return res.status(401).json({
+                success: false,
+                message: 'Account is deactivated.'
+            });
+        }
+
+        req.admin = admin;
+        next();
+    } catch (error) {
+        if (error.name === 'JsonWebTokenError') {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid token.'
+            });
+        }
+        
+        if (error.name === 'TokenExpiredError') {
+            return res.status(401).json({
+                success: false,
+                message: 'Token expired.'
+            });
+        }
+
+        res.status(500).json({
+            success: false,
+            message: 'Server error during authentication.'
+        });
+    }
+};
+
+module.exports = auth;
+
+// middleware/validation.js
+const { body, validationResult } = require('express-validator');
+
+const handleValidationErrors = (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Validation failed',
+            errors: errors.array().map(error => ({
+                field: error.path,
+                message: error.msg,
+                value: error.value
+            }))
+        });
+    }
+    next();
+};
+
+const employeeValidation = [
+    body('personalInfo.firstName')
+        .trim()
+        .isLength({ min: 2, max: 50 })
+        .withMessage('First name must be between 2 and 50 characters'),
+    
+    body('personalInfo.lastName')
+        .trim()
+        .isLength({ min: 2, max: 50 })
+        .withMessage('Last name must be between 2 and 50 characters'),
+    
+    body('personalInfo.email')
+        .isEmail()
+        .normalizeEmail()
+        .withMessage('Please provide a valid email address'),
+    
+    body('personalInfo.phone')
+        .matches(/^[\+]?[1-9][\d]{0,15}$/)
+        .withMessage('Please provide a valid phone number'),
+    
+    body('personalInfo.dateOfBirth')
+        .isISO8601()
+        .isBefore()
+        .withMessage('Date of birth must be a valid date in the past'),
+    
+    body('employment.department')
+        .isIn(['Engineering', 'Marketing', 'Sales', 'HR', 'Finance', 'Operations', 'IT', 'Legal'])
+        .withMessage('Invalid department'),
+    
+    body('employment.position')
+        .trim()
+        .isLength({ min: 2, max: 100 })
+        .withMessage('Position must be between 2 and 100 characters'),
+    
+    body('employment.startDate')
+        .isISO8601()
+        .custom((value) => {
+            if (new Date(value) > new Date()) {
+                throw new Error('Start date cannot be in the future');
+            }
+            return true;
+        }),
+    
+    body('compensation.salary')
+        .isNumeric()
+        .isFloat({ min: 0 })
+        .withMessage('Salary must be a positive number'),
+    
+    handleValidationErrors
+];
+
+const loginValidation = [
+    body('username')
+        .trim()
+        .isLength({ min: 3 })
+        .withMessage('Username must be at least 3 characters'),
+    
+    body('password')
+        .isLength({ min: 6 })
+        .withMessage('Password must be at least 6 characters'),
+    
+    handleValidationErrors
+];
+
+module.exports = {
+    employeeValidation,
+    loginValidation,
+    handleValidationErrors
+};
+
+// routes/auth.js
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const Admin = require('../models/Admin');
+const { loginValidation } = require('../middleware/validation');
+const auth = require('../middleware/auth');
+
+const router = express.Router();
+
+// @route   POST /api/auth/login
+// @desc    Admin login
+// @access  Public
+router.post('/login', loginValidation, async (req, res) => {
+    try {
+        const { username, password } = req.body;
+
+        // Find admin by username
+        const admin = await Admin.findOne({ username }).select('+password');
+        
+        if (!admin) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid credentials'
+            });
+        }
+
+        // Check if account is locked
+        if (admin.isLocked) {
+            return res.status(423).json({
+                success: false,
+                message: 'Account is temporarily locked due to too many failed login attempts'
+            });
+        }
+
+        // Check if account is active
+        if (!admin.isActive) {
+            return res.status(401).json({
+                success: false,
+                message: 'Account is deactivated'
+            });
+        }
+
+        // Compare password
+        const isMatch = await admin.comparePassword(password);
+        
+        if (!isMatch) {
+            await admin.incLoginAttempts();
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid credentials'
+            });
+        }
+
+        // Reset login attempts on successful login
+        await admin.resetLoginAttempts();
+
+        // Generate JWT token
+        const token = jwt.sign(
+            { id: admin._id, username: admin.username, role: admin.role },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRE }
+        );
+
+        res.json({
+            success: true,
+            message: 'Login successful',
+            data: {
+                token,
+                admin: {
+                    id: admin._id,
+                    username: admin.username,
+                    email: admin.email,
+                    role: admin.role,
+                    lastLogin: admin.lastLogin
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error during login'
+        });
+    }
+});
+
+// @route   GET /api/auth/profile
+// @desc    Get admin profile
+// @access  Private
+router.get('/profile', auth, async (req, res) => {
+    try {
+        res.json({
+            success: true,
+            data: {
+                admin: {
+                    id: req.admin._id,
+                    username: req.admin.username,
+                    email: req.admin.email,
+                    role: req.admin.role,
+                    lastLogin: req.admin.lastLogin,
+                    createdAt: req.admin.createdAt
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Profile error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error fetching profile'
+        });
+    }
+});
+
+// @route   POST /api/auth/logout
+// @desc    Admin logout (client-side token removal)
+// @access  Private
+router.post('/logout', auth, async (req, res) => {
+    try {
+        res.json({
+            success: true,
+            message: 'Logout successful'
+        });
+    } catch (error) {
+        console.error('Logout error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error during logout'
+        });
+    }
+});
+
+module.exports = router;
+
+// routes/employees.js
+const express = require('express');
+const Employee = require('../models/Employee');
+const { employeeValidation } = require('../middleware/validation');
+const auth = require('../middleware/auth');
+
+const router = express.Router();
+
+// @route   GET /api/employees
+// @desc    Get all employees with filtering, sorting, and pagination
+// @access  Private
+router.get('/', auth, async (req, res) => {
+    try {
+        const {
+            page = 1,
+            limit = 10,
+            department,
+            status,
+            search,
+            sortBy = 'createdAt',
+            sortOrder = 'desc'
+        } = req.query;
+
+        // Build filter object
+        const filter = { isActive: true };
+        
+        if (department) {
+            filter['employment.department'] = department;
+        }
+        
+        if (status) {
+            filter['employment.status'] = status;
+        }
+        
+        if (search) {
+            filter.$or = [
+                { 'personalInfo.firstName': { $regex: search, $options: 'i' } },
+                { 'personalInfo.lastName': { $regex: search, $options: 'i' } },
+                { 'personalInfo.email': { $regex: search, $options: 'i' } },
+                { employeeId: { $regex: search, $options: 'i' } }
+            ];
+        }
+
+        // Calculate pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const sortOptions = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
+
+        // Execute queries
+        const [employees, total] = await Promise.all([
+            Employee.find(filter)
+                .sort(sortOptions)
+                .skip(skip)
+                .limit(parseInt(limit))
+                .populate('employment.manager', 'personalInfo.firstName personalInfo.lastName employeeId')
+                .select('-documents'),
+            Employee.countDocuments(filter)
+        ]);
+
+        res.json({
+            success: true,
+            data: {
+                employees,
+                pagination: {
+                    currentPage: parseInt(page),
+                    totalPages: Math.ceil(total / parseInt(limit)),
+                    totalEmployees: total,
+                    hasNextPage: skip + employees.length < total,
+                    hasPrevPage: parseInt(page) > 1
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Get employees error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error fetching employees'
+        });
+    }
+});
+
+// @route   GET /api/employees/:id
+// @desc    Get employee by ID
+// @access  Private
+router.get('/:id', auth, async (req, res) => {
+    try {
+        const employee = await Employee.findOne({
+            _id: req.params.id,
+            isActive: true
+        }).populate('employment.manager', 'personalInfo.firstName personalInfo.lastName employeeId');
+
+        if (!employee) {
+            return res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            data: { employee }
+        });
+    } catch (error) {
+        console.error('Get employee error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error fetching employee'
+        });
+    }
+});
+
+// @route   POST /api/employees
+// @desc    Create new employee
+// @access  Private
+router.post('/', auth, employeeValidation, async (req, res) => {
+    try {
+        // Check if email already exists
+        const existingEmployee = await Employee.findOne({
+            'personalInfo.email': req.body.personalInfo.email,
+            isActive: true
+        });
+
+        if (existingEmployee) {
+            return res.status(400).json({
+                success: false,
+                message: 'Employee with this email already exists'
+            });
+        }
+
+        const employee = new Employee(req.body);
+        await employee.save();
+
+        // Populate manager info for response
+        await employee.populate('employment.manager', 'personalInfo.firstName personalInfo.lastName employeeId');
+
+        res.status(201).json({
+            success: true,
+            message: 'Employee created successfully',
+            data: { employee }
+        });
+    } catch (error) {
+        console.error('Create employee error:', error);
+        
+        if (error.name === 'ValidationError') {
+            const errors = Object.values(error.errors).map(err => ({
+                field: err.path,
+                message: err.message
+            }));
+            
+            return res.status(400).json({
+                success: false,
+                message: 'Validation failed',
+                errors
+            });
+        }
+
+        res.status(500).json({
+            success: false,
+            message: 'Server error creating employee'
+        });
+    }
+});
+
+// @route   PUT /api/employees/:id
+// @desc    Update employee
+// @access  Private
+router.put('/:id', auth, employeeValidation, async (req, res) => {
+    try {
+        const employee = await Employee.findOne({
+            _id: req.params.id,
+            isActive: true
+        });
+
+        if (!employee) {
+            return res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+        }
+
+        // Check if email is being changed to an existing email
+        if (req.body.personalInfo?.email && 
+            req.body.personalInfo.email !== employee.personalInfo.email) {
+            const existingEmployee = await Employee.findOne({
+                'personalInfo.email': req.body.personalInfo.email,
+                isActive: true,
+                _id: { $ne: req.params.id }
+            });
+
+            if (existingEmployee) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Employee with this email already exists'
+                });
+            }
+        }
+
+        // Update employee
+        Object.assign(employee, req.body);
+        await employee.save();
+
+        // Populate manager info for response
+        await employee.populate('employment.manager', 'personalInfo.firstName personalInfo.lastName employeeId');
+
+        res.json({
+            success: true,
+            message: 'Employee updated successfully',
+            data: { employee }
+        });
+    } catch (error) {
+        console.error('Update employee error:', error);
+        
+        if (error.name === 'ValidationError') {
+            const errors = Object.values(error.errors).map(err => ({
+                field: err.path,
+                message: err.message
+            }));
+            
+            return res.status(400).json({
+                success: false,
+                message: 'Validation failed',
+                errors
+            });
+        }
+
+        res.status(500).json({
+            success: false,
+            message: 'Server error updating employee'
+        });
+    }
+});
+
+// @route   DELETE /api/employees/:id
+// @desc    Soft delete employee
+// @access  Private
+router.delete('/:id', auth, async (req, res) => {
+    try {
+        const employee = await Employee.findOne({
+            _id: req.params.id,
+            isActive: true
+        });
+
+        if (!employee) {
+            return res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+        }
+
+        // Soft delete by setting isActive to false
+        employee.isActive = false;
+        employee.employment.status = 'Terminated';
+        employee.employment.endDate = new Date();
+        
+        await employee.save();
+
+        res.json({
+            success
